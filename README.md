@@ -40,6 +40,14 @@ curl -H "X-Target-URL: https://example.com/some/path" http://127.0.0.1:8880/some
 
 - `LISTEN_ADDR` — default `:8880`
 - `CLIENT_HELLO` — `chrome` (default) or `firefox`, selects the uTLS `ClientHelloID`
+- `UPSTREAM_PROXY_ADDR` — optional, `host:port` of an upstream HTTP CONNECT proxy (e.g. a
+  residential proxy provider's gateway). When set, this process tunnels through it via `CONNECT`
+  before doing its own uTLS handshake — the upstream proxy only ever sees opaque TLS bytes, it
+  never terminates TLS itself, so the fingerprint stays genuine. A fresh upstream connection is
+  opened per request, so pointing this at a *rotating* gateway endpoint rotates the exit IP for
+  free, with no extra logic needed here.
+- `UPSTREAM_PROXY_USER` / `UPSTREAM_PROXY_PASS` — optional, sent as `Proxy-Authorization: Basic`
+  on the `CONNECT` request when `UPSTREAM_PROXY_ADDR` is set
 
 ## Running
 

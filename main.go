@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,29 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 )
+
+// upstreamProxy, when configured, is an HTTP CONNECT proxy (e.g. a residential proxy
+// provider's gateway) this process tunnels through before doing its own uTLS handshake.
+// Point it at a *rotating* gateway endpoint and IP rotation falls out for free: this process
+// opens a fresh upstream connection per request, and a rotating gateway hands out a new exit IP
+// per connection.
+type upstreamProxy struct {
+	addr string // host:port
+	user string
+	pass string
+}
+
+func upstreamProxyFromEnv() *upstreamProxy {
+	addr := os.Getenv("UPSTREAM_PROXY_ADDR")
+	if addr == "" {
+		return nil
+	}
+	return &upstreamProxy{
+		addr: addr,
+		user: os.Getenv("UPSTREAM_PROXY_USER"),
+		pass: os.Getenv("UPSTREAM_PROXY_PASS"),
+	}
+}
 
 const targetHeader = "X-Target-URL"
 
@@ -41,15 +65,21 @@ var hopByHopHeaders = map[string]bool{
 func main() {
 	listenAddr := envOr("LISTEN_ADDR", ":8880")
 	helloID := clientHelloID(envOr("CLIENT_HELLO", "chrome"))
+	upstream := upstreamProxyFromEnv()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/", proxyHandler(helloID))
+	mux.HandleFunc("/", proxyHandler(helloID, upstream))
 
-	log.Printf("tls-utls-proxy listening on %s (client hello: %s)", listenAddr, os.Getenv("CLIENT_HELLO"))
+	upstreamDesc := "none (dialing origins directly)"
+	if upstream != nil {
+		upstreamDesc = upstream.addr
+	}
+	log.Printf("tls-utls-proxy listening on %s (client hello: %s, upstream proxy: %s)",
+		listenAddr, os.Getenv("CLIENT_HELLO"), upstreamDesc)
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -71,7 +101,7 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func proxyHandler(helloID utls.ClientHelloID) http.HandlerFunc {
+func proxyHandler(helloID utls.ClientHelloID, upstream *upstreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		targetRaw := r.Header.Get(targetHeader)
 		if targetRaw == "" {
@@ -90,7 +120,7 @@ func proxyHandler(helloID utls.ClientHelloID) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		tlsConn, err := dialUTLS(ctx, target.Host, helloID)
+		tlsConn, err := dialUTLS(ctx, target.Host, helloID, upstream)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("uTLS dial to %s failed: %v", target.Host, err), http.StatusBadGateway)
 			return
@@ -123,16 +153,15 @@ func proxyHandler(helloID utls.ClientHelloID) http.HandlerFunc {
 	}
 }
 
-func dialUTLS(ctx context.Context, hostPort string, helloID utls.ClientHelloID) (*utls.UConn, error) {
+func dialUTLS(ctx context.Context, hostPort string, helloID utls.ClientHelloID, upstream *upstreamProxy) (*utls.UConn, error) {
 	if !strings.Contains(hostPort, ":") {
 		hostPort += ":443"
 	}
 	host := hostOnly(hostPort)
 
-	dialer := &net.Dialer{}
-	rawConn, err := dialer.DialContext(ctx, "tcp", hostPort)
+	rawConn, err := dialRaw(ctx, hostPort, upstream)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dial: %w", err)
+		return nil, err
 	}
 
 	tlsConn := utls.UClient(rawConn, &utls.Config{ServerName: host}, helloID)
@@ -144,6 +173,60 @@ func dialUTLS(ctx context.Context, hostPort string, helloID utls.ClientHelloID) 
 		return nil, fmt.Errorf("uTLS handshake: %w", err)
 	}
 	return tlsConn, nil
+}
+
+// dialRaw returns a plaintext net.Conn to hostPort — either a direct TCP connection, or, when an
+// upstreamProxy is configured, a connection tunneled through it via HTTP CONNECT. Either way the
+// caller does its own TLS on top: the upstream proxy only ever sees opaque TLS bytes after the
+// CONNECT handshake, it never terminates TLS itself.
+func dialRaw(ctx context.Context, hostPort string, upstream *upstreamProxy) (net.Conn, error) {
+	dialer := &net.Dialer{}
+
+	if upstream == nil {
+		conn, err := dialer.DialContext(ctx, "tcp", hostPort)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial: %w", err)
+		}
+		return conn, nil
+	}
+
+	conn, err := dialer.DialContext(ctx, "tcp", upstream.addr)
+	if err != nil {
+		return nil, fmt.Errorf("upstream proxy dial: %w", err)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	connectReq := "CONNECT " + hostPort + " HTTP/1.1\r\nHost: " + hostPort + "\r\n"
+	if upstream.user != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(upstream.user + ":" + upstream.pass))
+		connectReq += "Proxy-Authorization: Basic " + creds + "\r\n"
+	}
+	connectReq += "\r\n"
+
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy CONNECT write: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy CONNECT response: %w", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy CONNECT rejected: %s", resp.Status)
+	}
+	if reader.Buffered() > 0 {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy sent data before CONNECT completed")
+	}
+
+	return conn, nil
 }
 
 func hostOnly(hostPort string) string {
