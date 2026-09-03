@@ -1,0 +1,11 @@
+services:
+  tls-utls-proxy:
+    build: .
+    ports:
+      - "127.0.0.1:8880:8880"
+    environment:
+      LISTEN_ADDR: ":8880"
+      CLIENT_HELLO: "chrome"
+      # Point at Proxyman (or any HTTP CONNECT proxy) running on the host to
+      # inspect the outbound request this proxy makes to the origin.
+      UPSTREAM_PROXY_ADDR: "host.docker.internal:9090"
