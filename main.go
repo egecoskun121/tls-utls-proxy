@@ -24,6 +24,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // upstreamProxy, when configured, is an HTTP CONNECT proxy (e.g. a residential proxy
@@ -135,12 +136,12 @@ func proxyHandler(helloID utls.ClientHelloID, upstream *upstreamProxy) http.Hand
 		copyHeaders(r.Header, outReq.Header, targetHeader)
 		outReq.Host = hostOnly(target.Host)
 
-		if err := outReq.Write(tlsConn); err != nil {
-			http.Error(w, "could not write outbound request: "+err.Error(), http.StatusBadGateway)
-			return
+		var resp *http.Response
+		if tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+			resp, err = doHTTP2(tlsConn, outReq)
+		} else {
+			resp, err = doHTTP1(tlsConn, outReq)
 		}
-
-		resp, err := http.ReadResponse(bufio.NewReader(tlsConn), outReq)
 		if err != nil {
 			http.Error(w, "could not read origin response: "+err.Error(), http.StatusBadGateway)
 			return
@@ -151,6 +152,28 @@ func proxyHandler(helloID utls.ClientHelloID, upstream *upstreamProxy) http.Hand
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+// doHTTP1 sends outReq as a plain HTTP/1.1 message over conn and parses the response the
+// same way — used when ALPN negotiated "http/1.1" (or nothing) during the uTLS handshake.
+func doHTTP1(conn *utls.UConn, outReq *http.Request) (*http.Response, error) {
+	if err := outReq.Write(conn); err != nil {
+		return nil, fmt.Errorf("could not write outbound request: %w", err)
+	}
+	return http.ReadResponse(bufio.NewReader(conn), outReq)
+}
+
+// doHTTP2 speaks HTTP/2 over conn — used when ALPN negotiated "h2" during the uTLS handshake,
+// which real browsers do by default and a plain http.ReadResponse (HTTP/1.x only) can't parse.
+// NewClientConn runs the HTTP/2 client preface and SETTINGS exchange on top of the
+// already-established uTLS connection; the TLS handshake itself is untouched.
+func doHTTP2(conn *utls.UConn, outReq *http.Request) (*http.Response, error) {
+	t := &http2.Transport{}
+	cc, err := t.NewClientConn(conn)
+	if err != nil {
+		return nil, fmt.Errorf("http2 client conn: %w", err)
+	}
+	return cc.RoundTrip(outReq)
 }
 
 func dialUTLS(ctx context.Context, hostPort string, helloID utls.ClientHelloID, upstream *upstreamProxy) (*utls.UConn, error) {
