@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -102,6 +103,20 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// maxRedirects caps how many hops proxyHandler will follow before giving up — matches the
+// ceiling net/http's own client uses to avoid infinite redirect loops.
+const maxRedirects = 10
+
+func isRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
 func proxyHandler(helloID utls.ClientHelloID, upstream *upstreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		targetRaw := r.Header.Get(targetHeader)
@@ -121,31 +136,80 @@ func proxyHandler(helloID utls.ClientHelloID, upstream *upstreamProxy) http.Hand
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		tlsConn, err := dialUTLS(ctx, target.Host, helloID, upstream)
+		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("uTLS dial to %s failed: %v", target.Host, err), http.StatusBadGateway)
+			http.Error(w, "could not read request body: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer tlsConn.Close()
 
-		outReq, err := http.NewRequestWithContext(ctx, r.Method, target.String(), r.Body)
-		if err != nil {
-			http.Error(w, "could not build outbound request: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		copyHeaders(r.Header, outReq.Header, targetHeader)
-		outReq.Host = hostOnly(target.Host)
+		reqURL := target
+		method := r.Method
 
 		var resp *http.Response
-		if tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
-			resp, err = doHTTP2(tlsConn, outReq)
-		} else {
-			resp, err = doHTTP1(tlsConn, outReq)
+		var tlsConn *utls.UConn
+
+		for hop := 0; ; hop++ {
+			if hop >= maxRedirects {
+				http.Error(w, "too many redirects", http.StatusBadGateway)
+				return
+			}
+
+			conn, err := dialUTLS(ctx, reqURL.Host, helloID, upstream)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("uTLS dial to %s failed: %v", reqURL.Host, err), http.StatusBadGateway)
+				return
+			}
+
+			outReq, err := http.NewRequestWithContext(ctx, method, reqURL.String(), bytes.NewReader(bodyBytes))
+			if err != nil {
+				conn.Close()
+				http.Error(w, "could not build outbound request: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			copyHeaders(r.Header, outReq.Header, targetHeader)
+			outReq.Host = hostOnly(reqURL.Host)
+
+			var hopResp *http.Response
+			if conn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+				hopResp, err = doHTTP2(conn, outReq)
+			} else {
+				hopResp, err = doHTTP1(conn, outReq)
+			}
+			if err != nil {
+				conn.Close()
+				http.Error(w, "could not read origin response: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+
+			// Only follow the redirect if we can reach it over another uTLS-terminated HTTPS
+			// hop — this proxy has no plain-HTTP path to an origin, so a non-https Location is
+			// returned to the caller as-is rather than followed.
+			if isRedirectStatus(hopResp.StatusCode) {
+				if loc := hopResp.Header.Get("Location"); loc != "" {
+					if nextURL, perr := reqURL.Parse(loc); perr == nil && nextURL.Scheme == "https" {
+						_, _ = io.Copy(io.Discard, hopResp.Body)
+						hopResp.Body.Close()
+						conn.Close()
+
+						// 303 always downgrades to GET; 301/302 downgrade only a POST, per
+						// how browsers actually behave (the RFC's original 301/302 semantics
+						// were method-preserving, but no browser ever implemented that).
+						if hopResp.StatusCode == http.StatusSeeOther ||
+							((hopResp.StatusCode == http.StatusMovedPermanently || hopResp.StatusCode == http.StatusFound) && method == http.MethodPost) {
+							method = http.MethodGet
+							bodyBytes = nil
+						}
+						reqURL = nextURL
+						continue
+					}
+				}
+			}
+
+			resp = hopResp
+			tlsConn = conn
+			break
 		}
-		if err != nil {
-			http.Error(w, "could not read origin response: "+err.Error(), http.StatusBadGateway)
-			return
-		}
+		defer tlsConn.Close()
 		defer resp.Body.Close()
 
 		copyHeaders(resp.Header, w.Header(), "")
